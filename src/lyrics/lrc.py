@@ -39,6 +39,24 @@ def _strip_word_level_tags(text: str) -> str:
     return re.sub(r"<\d{1,2}:\d{2}(?:\.\d{1,3})?>", "", text).strip()
 
 
+# Enhanced LRC: <mm:ss.xx>word (absolute times, same as bracket LRC)
+_WORD_TAG = re.compile(r"<(\d+):(\d+)(?:\.(\d{1,6}))?>\s*([^<]*)")
+
+
+def _try_expand_enhanced_words(chunk: str) -> list[LyricLine] | None:
+    """If chunk uses inline <time> tags, return one LyricLine per word; else None."""
+    if "<" not in chunk or not re.search(r"<\d{1,2}:\d{2}", chunk):
+        return None
+    out: list[LyricLine] = []
+    for m in _WORD_TAG.finditer(chunk):
+        mm, ss, frac = int(m.group(1)), int(m.group(2)), m.group(3)
+        ts = mm * 60 + ss + _fraction_to_seconds(frac)
+        tx = (m.group(4) or "").strip()
+        if tx:
+            out.append(LyricLine(time_s=ts, text=tx))
+    return out if out else None
+
+
 def parse_lrc(raw: str) -> list[LyricLine]:
     """Return sorted lyric lines (empty lines and metadata skipped)."""
     entries: list[LyricLine] = []
@@ -53,9 +71,13 @@ def parse_lrc(raw: str) -> list[LyricLine]:
             t = _parse_timestamp(m)
             end = matches[j + 1].start() if j + 1 < len(matches) else len(line)
             chunk = line[m.end() : end].strip()
-            text = _strip_word_level_tags(chunk)
-            if text:
-                entries.append(LyricLine(time_s=t, text=text))
+            expanded = _try_expand_enhanced_words(chunk)
+            if expanded:
+                entries.extend(expanded)
+            else:
+                text = _strip_word_level_tags(chunk)
+                if text:
+                    entries.append(LyricLine(time_s=t, text=text))
 
     entries.sort(key=lambda e: e.time_s)
     # Drop duplicate (time, text) pairs
