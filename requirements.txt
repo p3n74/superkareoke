@@ -29,3 +29,6 @@ soundfile>=0.12.1
 
 # Environment / config
 python-dotenv>=1.0.0
+
+# Optional: Silero VAD (voice activity gate for the vocal monitor) is
+# fetched on first use via torch.hub; no separate install required.

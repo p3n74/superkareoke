@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -8,12 +9,17 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont
 
+log = logging.getLogger(__name__)
+
 from src.config import CATALOG_DIR
 from src.database.manager import DatabaseManager
 from src.database.models import Song, PitchMap
 from src.audio.mic_input import MicInput
 from src.audio.playback import AudioPlayback
 from src.audio.pitch_detector import RealtimePitchDetector
+from src.audio.mic_processor import MicProcessor, MicProcessorSettings
+from src.audio.voice_fx import VoiceFx
+from src.audio.vocal_monitor import VocalMonitor
 from src.scoring.comparator import PitchComparator
 from src.scoring.scorer import build_performance
 from src.ui.pitch_widget import PitchWidget
@@ -88,6 +94,7 @@ class PerformanceView(QWidget):
         mic_device_fn: Optional[Callable[[], Optional[int]]] = None,
         output_device_fn: Optional[Callable[[], Optional[int]]] = None,
         scoring_difficulty_fn: Optional[Callable[[], str]] = None,
+        vocal_chain_settings_fn: Optional[Callable[[], dict]] = None,
         parent=None,
     ):
         super().__init__(parent)
@@ -95,13 +102,19 @@ class PerformanceView(QWidget):
         self._mic_device_fn = mic_device_fn or (lambda: None)
         self._output_device_fn = output_device_fn or (lambda: None)
         self._scoring_difficulty_fn = scoring_difficulty_fn or (lambda: "strict")
+        self._vocal_chain_settings_fn = vocal_chain_settings_fn or (lambda: {})
         self._song: Song | None = None
         self._pitch_map: PitchMap | None = None
         self._comparator: PitchComparator | None = None
 
-        self._mic = MicInput()
-        self._playback = AudioPlayback()
+        self._mic = MicInput(chunk_size=512)
+        self._playback = AudioPlayback(blocksize=512)
         self._detector = RealtimePitchDetector()
+        self._mic_proc = MicProcessor(self._mic.sample_rate)
+        self._voice_fx = VoiceFx(self._mic.sample_rate)
+        self._monitor = VocalMonitor(sample_rate=self._mic.sample_rate, blocksize=512)
+        self._last_monitor_status: str = ""
+        self._bypass_effects: bool = False
 
         self._setup_ui()
         self._connect_signals()
@@ -172,6 +185,9 @@ class PerformanceView(QWidget):
         self._time_label = QLabel("0:00 / 0:00")
         self._time_label.setStyleSheet("color: #888; font-size: 11px;")
         bottom.addWidget(self._time_label)
+        self._monitor_status_label = QLabel("")
+        self._monitor_status_label.setStyleSheet("color: #f0ad4e; font-size: 11px; padding-left: 12px;")
+        bottom.addWidget(self._monitor_status_label)
         bottom.addStretch()
         self._note_label = QLabel("")
         self._note_label.setStyleSheet("color: #5bc0de; font-size: 14px; font-weight: bold;")
@@ -180,9 +196,27 @@ class PerformanceView(QWidget):
 
     def _connect_signals(self):
         self._mic.audio_chunk.connect(self._on_mic_chunk)
+        # Low-jitter monitor pipeline runs on the audio thread, not via the
+        # Qt event loop. This keeps the monitor immune to GUI repaints / busy
+        # event-loop ticks (which were causing the "kztzt" buffer drops).
+        self._mic.set_audio_processor(self._audio_thread_pipeline)
         self._detector.pitch_detected.connect(self._on_pitch_detected)
         self._playback.position_changed.connect(self._on_position)
         self._playback.playback_finished.connect(self._on_song_end)
+
+    def _audio_thread_pipeline(self, chunk, sr):
+        """Runs in the PortAudio capture thread. Keep this CHEAP and SAFE."""
+        if not self._monitor.enabled:
+            return
+        try:
+            if self._bypass_effects:
+                self._monitor.write(chunk.astype("float32", copy=False), source_sr=sr)
+                return
+            _clean, monitor_in = self._mic_proc.process(chunk)
+            wet = self._voice_fx.process(monitor_in)
+            self._monitor.write(wet, source_sr=sr)
+        except Exception:
+            log.debug("audio-thread pipeline error", exc_info=True)
 
     def _original_mix_path(self) -> Path | None:
         if not self._song or not self._song.original_path:
@@ -225,7 +259,7 @@ class PerformanceView(QWidget):
         self._guide_vocal_check.blockSignals(False)
 
     def apply_audio_devices(self) -> None:
-        """Apply microphone and backing-track output from Settings."""
+        """Apply microphone, backing-track output, monitor device and vocal chain settings."""
         out = self._output_device_fn()
         mic = self._mic_device_fn()
         self._playback.set_output_device(out)
@@ -236,6 +270,77 @@ class PerformanceView(QWidget):
                 self._mic.start()
         else:
             self._mic.device = mic
+
+        self._apply_vocal_chain_settings()
+
+    def _compose_monitor_status(
+        self,
+        requested: bool,
+        applied: bool,
+        feedback_blocked: bool,
+        same_device: bool,
+    ) -> str:
+        if not requested:
+            return ""
+        if feedback_blocked:
+            return (
+                "Vocal monitor muted: same output as backing track. "
+                "Pick a separate Monitor output (e.g. headphones) in Settings, "
+                "or disable Feedback protection."
+            )
+        if applied and not self._playback.is_playing:
+            return "Vocal monitor will start when you press Start."
+        if applied and same_device:
+            return "Vocal monitor on (mixed into backing-track output — use headphones to avoid feedback)."
+        if applied:
+            return "Vocal monitor on."
+        return ""
+
+    def _apply_vocal_chain_settings(self) -> None:
+        cfg = self._vocal_chain_settings_fn() or {}
+        mic_proc = cfg.get("mic_processor") or {}
+        fx_params = cfg.get("voice_fx") or {}
+        monitor_enabled = bool(cfg.get("monitor_enabled", False))
+        monitor_device = cfg.get("monitor_device")  # None = same as backing
+        monitor_gain_db = float(cfg.get("monitor_gain_db", 0.0))
+        feedback_protection = bool(cfg.get("feedback_protection", True))
+        self._bypass_effects = bool(cfg.get("bypass_effects", False))
+
+        self._mic_proc.apply_settings(MicProcessorSettings.from_dict(mic_proc))
+        if fx_params:
+            self._voice_fx.apply_params(fx_params)
+
+        backing_dev = self._output_device_fn()
+        # If "Same as backing", use the backing-track output device
+        target_dev = monitor_device if monitor_device is not None else backing_dev
+
+        # Feedback protection: if monitor would share the backing-track device,
+        # mute the monitor unless the user has explicitly turned protection off.
+        feedback_blocked = False
+        if monitor_enabled and feedback_protection and target_dev == backing_dev:
+            feedback_blocked = True
+            monitor_enabled = False
+        status = self._compose_monitor_status(
+            requested=bool(cfg.get("monitor_enabled", False)),
+            applied=monitor_enabled,
+            feedback_blocked=feedback_blocked,
+            same_device=target_dev == backing_dev,
+        )
+        if hasattr(self, "_monitor_status_label"):
+            self._monitor_status_label.setText(status)
+        if status != self._last_monitor_status:
+            if status:
+                log.info("Vocal monitor status: %s", status)
+            self._last_monitor_status = status
+
+        # 512-sample blocks (~11.6 ms each) drive end-to-end monitor latency
+        # down. PortAudio in 'low' / WASAPI mode handles this comfortably.
+        self._mic.set_chunk_size(512)
+        self._playback.set_blocksize(512)
+
+        self._monitor.set_gain_db(monitor_gain_db)
+        self._monitor.set_device(target_dev)
+        self._monitor.set_enabled(monitor_enabled and self._playback.is_playing)
 
     def load_song(self, song: Song):
         self._stop()
@@ -273,6 +378,7 @@ class PerformanceView(QWidget):
         if self._playback.is_playing:
             self._playback.pause()
             self._mic.stop()
+            self._monitor.set_enabled(False)
             self._pitch_widget.stop_rendering()
             self._play_btn.setText("▶ Resume")
             self._sync_guide_checkbox()
@@ -285,16 +391,22 @@ class PerformanceView(QWidget):
                     difficulty_id=diff,
                 )
             self.apply_audio_devices()
+            self._mic_proc.reset()
             self._playback.play()
             self._mic.start()
             self._sync_guide_checkbox()
             self._pitch_widget.start_rendering()
+            # apply_audio_devices() ran before play(); re-evaluate monitor now that
+            # playback is actually running so the stream opens.
+            self._apply_vocal_chain_settings()
             self._play_btn.setText("⏸ Pause")
             self._stop_btn.setEnabled(True)
 
     def _stop(self):
         self._playback.stop()
         self._mic.stop()
+        self._monitor.set_enabled(False)
+        self._mic_proc.reset()
         self._pitch_widget.stop_rendering()
         self._pitch_widget.reset()
         self._comparator = None
@@ -306,7 +418,16 @@ class PerformanceView(QWidget):
         self._sync_guide_checkbox()
 
     def _on_mic_chunk(self, chunk, sr):
-        self._detector.process_chunk(chunk, sr)
+        """Runs on the Qt thread. Pitch detection only — the monitor pipeline
+        runs on the audio thread via ``_audio_thread_pipeline``.
+        """
+        if sr != self._mic_proc.sample_rate:
+            self._mic_proc.sample_rate = sr
+        if sr != self._voice_fx.sample_rate:
+            self._voice_fx.set_sample_rate(sr)
+        # Pitch can use the raw chunk; torchcrepe is robust to a little noise
+        # and we don't want to fight the audio-thread's mic_proc state.
+        self._detector.process_chunk(chunk.astype("float32", copy=False), sr)
 
     def _on_pitch_detected(self, freq: float, conf: float, note: str):
         self._pitch_widget.set_user_pitch(freq, conf)
@@ -326,6 +447,15 @@ class PerformanceView(QWidget):
         self._pitch_widget.set_time(time_s)
         self._lyrics.set_time(time_s)
         self._update_time_label(time_s, self._playback.duration)
+        # Every ~1 s log monitor diagnostics so we can spot underruns/drops.
+        if int(time_s) != getattr(self, "_last_diag_sec", -1) and self._monitor.enabled:
+            self._last_diag_sec = int(time_s)
+            d = self._monitor.diagnostics()
+            log.debug(
+                "monitor diag: queued=%d underrun=%d dropped=%d cap=%d sr=%d",
+                d["queued_samples"], d["underrun_samples"],
+                d["dropped_overflow_samples"], d["capacity"], d["sample_rate"],
+            )
 
     def _update_time_label(self, current: float, total: float):
         cur_m, cur_s = divmod(int(current), 60)

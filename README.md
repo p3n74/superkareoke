@@ -9,6 +9,13 @@ A Windows desktop application that tracks your singing pitch in real-time and co
 - **Real-time Scoring**: Cents-based pitch accuracy scoring with combo tracking and star ratings
 - **Live Mode**: Capture system audio (WASAPI loopback) and sing along to any audio playing on your PC
 - **Performance History**: Track your scores and improvement over time
+- **Vocal Chain**: Live mic cleanup (high-pass + noise gate + optional Silero VAD), vocal monitor output (hear yourself sing), and an effects chain (HPF, 3-band EQ, compressor, reverb, gain) with presets — Natural, Warm, Bright, Stage Reverb, Studio Polish
+
+## Vocal monitor and feedback
+
+Turn on **Settings → Vocal monitor** to route your mic through the effects chain to a chosen output device. **Use headphones for the monitor**, separate from the backing-track output. If both share the same speakers you'll get a feedback loop; the built-in *Feedback protection* keeps the monitor muted whenever the resolved monitor device equals the backing-track device.
+
+For the lowest latency on Windows, pick a **WASAPI** output device for the monitor — the app will automatically use WASAPI shared mode for tighter scheduling than MME / DirectSound.
 
 ## Requirements
 

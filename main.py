@@ -40,12 +40,14 @@ def main():
         mic_device_fn=lambda: settings_view.selected_mic_index,
         output_device_fn=lambda: settings_view.selected_output_device,
         scoring_difficulty_fn=lambda: settings_view.scoring_difficulty_id,
+        vocal_chain_settings_fn=lambda: settings_view.vocal_chain_settings,
     )
     live_view = LiveView()
 
     pipeline = ProcessingPipeline(db, use_gpu_fn=lambda: settings_view.use_gpu)
     settings_view.gpu_preference_changed.connect(pipeline.reset_processors)
     settings_view.audio_devices_changed.connect(performance_view.apply_audio_devices)
+    settings_view.vocal_chain_changed.connect(performance_view.apply_audio_devices)
     performance_view.apply_audio_devices()
 
     window.set_page(0, catalog_view)

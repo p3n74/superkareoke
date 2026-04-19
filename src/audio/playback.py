@@ -1,9 +1,34 @@
+import logging
+from math import gcd
+
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
 from pathlib import Path
 from PyQt6.QtCore import QObject, pyqtSignal, QTimer
 from typing import Optional
+
+log = logging.getLogger(__name__)
+
+
+def _wasapi_extras_for(device: Optional[int]):
+    """Return ``sd.WasapiSettings()`` if ``device`` is on the WASAPI host API.
+
+    Using WASAPI shared mode dramatically reduces output latency on Windows.
+    Returns ``None`` for non-WASAPI devices (or any error) so the caller can
+    safely fall through to the host's default backend.
+    """
+    if device is None:
+        return None
+    try:
+        info = sd.query_devices(device)
+        host = sd.query_hostapis(info["hostapi"])
+        name = str(host.get("name", "")).lower()
+        if "wasapi" in name:
+            return sd.WasapiSettings()
+    except Exception:
+        pass
+    return None
 
 
 class AudioPlayback(QObject):
@@ -27,9 +52,10 @@ class AudioPlayback(QObject):
                 })
         return out
 
-    def __init__(self, device: Optional[int] = None):
+    def __init__(self, device: Optional[int] = None, blocksize: int = 512):
         super().__init__()
         self.device = device
+        self.blocksize = int(blocksize)
         self._audio_data: Optional[np.ndarray] = None
         self._sample_rate: int = 44100
         self._stream: Optional[sd.OutputStream] = None
@@ -45,14 +71,80 @@ class AudioPlayback(QObject):
     def _make_output_stream(self) -> sd.OutputStream:
         if self._audio_data is None:
             raise RuntimeError("AudioPlayback: load a file before opening an output stream")
-        return sd.OutputStream(
-            samplerate=self._sample_rate,
-            channels=self._audio_data.shape[1],
-            device=self.device,
-            dtype="float32",
-            callback=self._playback_callback,
-            blocksize=2048,
-        )
+
+        extras = _wasapi_extras_for(self.device)
+
+        def _try_open(use_extras: bool) -> sd.OutputStream:
+            kwargs = dict(
+                samplerate=self._sample_rate,
+                channels=self._audio_data.shape[1],
+                device=self.device,
+                dtype="float32",
+                callback=self._playback_callback,
+                blocksize=self.blocksize,
+                latency="low",
+            )
+            if use_extras and extras is not None:
+                kwargs["extra_settings"] = extras
+            return sd.OutputStream(**kwargs)
+
+        try:
+            return _try_open(use_extras=True)
+        except sd.PortAudioError as first_err:
+            try:
+                return _try_open(use_extras=False)
+            except sd.PortAudioError as second_err:
+                # Invalid sample rate is the typical case (WASAPI shared mode
+                # locks to the Windows mixer rate). Resample the buffer to the
+                # device's preferred rate and retry.
+                target_sr = self._device_default_samplerate()
+                if target_sr is not None and target_sr != self._sample_rate:
+                    log.info(
+                        "Output device rejected %d Hz; resampling backing track to %d Hz",
+                        self._sample_rate, target_sr,
+                    )
+                    self._resample_to(target_sr)
+                    return _try_open(use_extras=False)
+                raise second_err from first_err
+
+    def _device_default_samplerate(self) -> Optional[int]:
+        try:
+            if self.device is None:
+                info = sd.query_devices(kind="output")
+            else:
+                info = sd.query_devices(self.device)
+            sr = int(info.get("default_samplerate", 0) or 0)
+            return sr if sr > 0 else None
+        except Exception:
+            return None
+
+    def _resample_to(self, target_sr: int) -> None:
+        """Resample the loaded buffer in-place to ``target_sr`` (mono / multi-ch)."""
+        if self._audio_data is None or target_sr <= 0 or target_sr == self._sample_rate:
+            return
+        from scipy.signal import resample_poly  # local import to avoid startup cost
+
+        old_sr = self._sample_rate
+        g = gcd(int(target_sr), int(old_sr))
+        up = int(target_sr // g)
+        down = int(old_sr // g)
+        n_ch = self._audio_data.shape[1]
+        # resample_poly works on 1-D; do per-channel and stack
+        cols = []
+        for ch in range(n_ch):
+            cols.append(
+                resample_poly(self._audio_data[:, ch], up, down).astype(np.float32, copy=False)
+            )
+        new_len = min(len(c) for c in cols)
+        new_data = np.empty((new_len, n_ch), dtype=np.float32)
+        for ch, c in enumerate(cols):
+            new_data[:, ch] = c[:new_len]
+        # Preserve current playback position in seconds
+        cur_time = self._position / max(1, old_sr)
+        self._audio_data = new_data
+        self._sample_rate = int(target_sr)
+        self._duration = new_len / float(target_sr)
+        self._position = max(0, min(int(cur_time * target_sr), new_len))
 
     def set_output_device(self, device: Optional[int]) -> None:
         """Change PortAudio output (``None`` = host default). Reopens the stream if playback is active or paused."""
@@ -89,6 +181,31 @@ class AudioPlayback(QObject):
         self._sample_rate = sr
         self._duration = len(data) / sr
         self._position = 0
+
+    def set_blocksize(self, blocksize: int) -> None:
+        """Update preferred device block size; reopens the stream if needed."""
+        blocksize = max(64, int(blocksize))
+        if blocksize == self.blocksize:
+            return
+        self.blocksize = blocksize
+        if self._stream is None:
+            return
+        was_paused = self._paused
+        was_active = self._playing and not self._paused
+        self._playing = False
+        self._timer.stop()
+        self._stream.stop()
+        self._stream.close()
+        self._stream = None
+        if was_active:
+            self._playing = True
+            self._paused = False
+            self._stream = self._make_output_stream()
+            self._stream.start()
+            self._timer.start()
+        elif was_paused:
+            self._paused = True
+            self._playing = False
 
     @property
     def duration(self) -> float:
