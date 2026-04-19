@@ -1,0 +1,27 @@
+# Secrets
+.env
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Local app data (catalog audio, SQLite)
+data/
+
+# Scratch / test DB files
+_thread_test.sqlite
+*.sqlite-journal
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
