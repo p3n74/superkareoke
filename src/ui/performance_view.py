@@ -3,7 +3,7 @@ from typing import Callable, Optional
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QDialog, QGridLayout,
+    QDialog, QGridLayout, QCheckBox,
 )
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont
@@ -15,7 +15,7 @@ from src.audio.mic_input import MicInput
 from src.audio.playback import AudioPlayback
 from src.audio.pitch_detector import RealtimePitchDetector
 from src.scoring.comparator import PitchComparator
-from src.scoring.scorer import build_performance, compute_star_rating
+from src.scoring.scorer import build_performance
 from src.ui.pitch_widget import PitchWidget
 from src.ui.lyrics_panel import LyricsPanel
 
@@ -144,6 +144,19 @@ class PerformanceView(QWidget):
 
         layout.addLayout(top_bar)
 
+        backing_row = QHBoxLayout()
+        backing_row.setContentsMargins(16, 0, 16, 8)
+        self._guide_vocal_check = QCheckBox("Include guide vocals (original mix with lead vocal)")
+        self._guide_vocal_check.setStyleSheet("color: #c8c8d0; font-size: 12px;")
+        self._guide_vocal_check.setToolTip(
+            "When checked, the backing track is the full downloaded mix so you can hear the "
+            "original singer for reference. When unchecked, only the isolated instrumental plays."
+        )
+        self._guide_vocal_check.stateChanged.connect(self._on_guide_vocal_toggled)
+        backing_row.addWidget(self._guide_vocal_check)
+        backing_row.addStretch()
+        layout.addLayout(backing_row)
+
         self._lyrics = LyricsPanel()
         layout.addWidget(self._lyrics, stretch=0)
 
@@ -168,6 +181,46 @@ class PerformanceView(QWidget):
         self._detector.pitch_detected.connect(self._on_pitch_detected)
         self._playback.position_changed.connect(self._on_position)
         self._playback.playback_finished.connect(self._on_song_end)
+
+    def _original_mix_path(self) -> Path | None:
+        if not self._song or not self._song.original_path:
+            return None
+        p = Path(self._song.original_path)
+        return p if p.is_file() else None
+
+    def _backing_track_path(self) -> Path | None:
+        """File used for speakers: full mix if guide vocals on, else instrumental."""
+        if not self._song or not self._song.instrumental_path:
+            return None
+        inst = Path(self._song.instrumental_path)
+        if not inst.is_file():
+            return None
+        if self._guide_vocal_check.isChecked():
+            orig = self._original_mix_path()
+            if orig is not None:
+                return orig
+        return inst
+
+    def _on_guide_vocal_toggled(self, _state: int) -> None:
+        if self._song is None or self._playback.is_playing:
+            return
+        path = self._backing_track_path()
+        if path is None:
+            return
+        t_save = self._playback.current_time
+        self._playback.load(path)
+        if t_save > 0.01:
+            self._playback.seek(t_save)
+        self._update_time_label(self._playback.current_time, self._playback.duration)
+
+    def _sync_guide_checkbox(self) -> None:
+        """Enable guide option only when original exists; reflect availability."""
+        self._guide_vocal_check.blockSignals(True)
+        has_orig = self._original_mix_path() is not None
+        self._guide_vocal_check.setEnabled(has_orig and not self._playback.is_playing)
+        if not has_orig:
+            self._guide_vocal_check.setChecked(False)
+        self._guide_vocal_check.blockSignals(False)
 
     def apply_audio_devices(self) -> None:
         """Apply microphone and backing-track output from Settings."""
@@ -196,10 +249,11 @@ class PerformanceView(QWidget):
         else:
             self._pitch_map = None
 
-        # Load instrumental
-        instrumental = Path(song.instrumental_path) if song.instrumental_path else None
-        if instrumental and instrumental.exists():
-            self._playback.load(instrumental)
+        # Load backing track (instrumental or original mix per checkbox)
+        self._sync_guide_checkbox()
+        backing = self._backing_track_path()
+        if backing is not None:
+            self._playback.load(backing)
             self._play_btn.setEnabled(True)
             self._update_time_label(0.0, self._playback.duration)
             self.apply_audio_devices()
@@ -218,12 +272,14 @@ class PerformanceView(QWidget):
             self._mic.stop()
             self._pitch_widget.stop_rendering()
             self._play_btn.setText("▶ Resume")
+            self._sync_guide_checkbox()
         else:
             if self._comparator is None and self._pitch_map:
                 self._comparator = PitchComparator(self._pitch_widget.note_segments)
             self.apply_audio_devices()
             self._playback.play()
             self._mic.start()
+            self._sync_guide_checkbox()
             self._pitch_widget.start_rendering()
             self._play_btn.setText("⏸ Pause")
             self._stop_btn.setEnabled(True)
@@ -239,6 +295,7 @@ class PerformanceView(QWidget):
         self._stop_btn.setEnabled(False)
         self._note_label.setText("")
         self._lyrics.set_time(0.0)
+        self._sync_guide_checkbox()
 
     def _on_mic_chunk(self, chunk, sr):
         self._detector.process_chunk(chunk, sr)
@@ -273,6 +330,7 @@ class PerformanceView(QWidget):
         self._play_btn.setText("▶ Start")
         self._play_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
+        self._sync_guide_checkbox()
 
         if self._comparator and self._song:
             self._comparator.finalize_remaining()
