@@ -63,6 +63,13 @@ class AddSongDialog(QDialog):
         """)
 
 
+_IN_PROGRESS = (
+    SongStatus.DOWNLOADING,
+    SongStatus.SEPARATING,
+    SongStatus.EXTRACTING_PITCH,
+)
+
+
 class CatalogView(QWidget):
     song_selected = pyqtSignal(Song)
     process_requested = pyqtSignal(Song)
@@ -159,9 +166,17 @@ class CatalogView(QWidget):
             status_item.setForeground(QColor(color))
             self.table.setItem(row, 2, status_item)
 
-            # Process button
-            proc_btn = QPushButton("Process")
-            proc_btn.setEnabled(song.status in (SongStatus.PENDING, SongStatus.ERROR))
+            # Process / Re-process button
+            can_process = song.status not in _IN_PROGRESS
+            proc_btn = QPushButton("Re-process" if song.status == SongStatus.READY else "Process")
+            proc_btn.setEnabled(can_process)
+            proc_btn.setToolTip(
+                "Run or re-run download, separation, pitch, and lyrics."
+                if song.status == SongStatus.READY
+                else "Run the processing pipeline for this song."
+            )
+            if song.status in _IN_PROGRESS:
+                proc_btn.setToolTip("Already processing — wait for it to finish or check the Processing page.")
             proc_btn.setStyleSheet("""
                 QPushButton {
                     background: #0f3460; color: #ddd; border: none;
@@ -170,7 +185,7 @@ class CatalogView(QWidget):
                 QPushButton:hover { background: #1a4a7a; }
                 QPushButton:disabled { background: #333; color: #666; }
             """)
-            proc_btn.clicked.connect(lambda _, s=song: self.process_requested.emit(s))
+            proc_btn.clicked.connect(lambda _, s=song: self._on_process_clicked(s))
             self.table.setCellWidget(row, 3, proc_btn)
 
             # Sing button
@@ -196,6 +211,21 @@ class CatalogView(QWidget):
             match = text.lower() in title or text.lower() in artist
             self.table.setRowHidden(row, not match)
 
+    def _on_process_clicked(self, song: Song):
+        if song.status == SongStatus.READY:
+            r = QMessageBox.question(
+                self,
+                "Re-process song",
+                f'Run the full pipeline again for "{song.title}"?\n\n'
+                "This re-downloads from YouTube (when needed), replaces stems, pitch data, and synced lyrics. "
+                "Your past performance scores stay in the database.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if r != QMessageBox.StandardButton.Yes:
+                return
+        self.process_requested.emit(song)
+
     def _add_song(self):
         dlg = AddSongDialog(self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
@@ -204,6 +234,20 @@ class CatalogView(QWidget):
             if not title:
                 QMessageBox.warning(self, "Missing Title", "Please enter a song title.")
                 return
+            dup = self.db.find_duplicate_song(title, artist)
+            if dup is not None:
+                r = QMessageBox.question(
+                    self,
+                    "Possible duplicate",
+                    f"A song with the same title and artist already exists:\n\n"
+                    f'"{dup.title}" — {dup.artist or "(no artist)"}\n'
+                    f"Status: {dup.status.value.replace('_', ' ').title()}\n\n"
+                    "Add another entry anyway?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if r != QMessageBox.StandardButton.Yes:
+                    return
             song = Song(title=title, artist=artist)
             self.db.add_song(song)
             self.refresh()

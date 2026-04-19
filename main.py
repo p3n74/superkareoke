@@ -39,6 +39,7 @@ def main():
         db,
         mic_device_fn=lambda: settings_view.selected_mic_index,
         output_device_fn=lambda: settings_view.selected_output_device,
+        scoring_difficulty_fn=lambda: settings_view.scoring_difficulty_id,
     )
     live_view = LiveView()
 

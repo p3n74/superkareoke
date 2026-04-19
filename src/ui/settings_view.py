@@ -110,6 +110,31 @@ class SettingsView(QWidget):
 
         layout.addWidget(spotify_group)
 
+        # Scoring difficulty
+        score_group = QGroupBox("Scoring difficulty")
+        score_group.setStyleSheet(audio_group.styleSheet())
+        score_form = QFormLayout(score_group)
+        self._difficulty_combo = QComboBox()
+        self._difficulty_combo.setStyleSheet(self._mic_combo.styleSheet())
+        self._difficulty_combo.addItem("Strict (tight pitch)", "strict")
+        self._difficulty_combo.addItem("Normal (balanced)", "normal")
+        self._difficulty_combo.addItem("Casual (2-3 keys forgiving)", "casual")
+        self._difficulty_combo.setCurrentIndex(1)
+        self._difficulty_combo.setToolTip(
+            "How far from each target note (in cents; 100 = one piano key) still counts as "
+            "Perfect … OK before a Miss. Casual is best for sing-alongs; Strict matches chart pro games."
+        )
+        score_form.addRow("Pitch tolerance:", self._difficulty_combo)
+        score_help = QLabel(
+            "Easier presets widen each tier so you can be a couple of semitones off and still score. "
+            "On Casual, the green target lanes also span one key above and below the note on the chart. "
+            "Applies the next time you press Start on the Sing screen (or when you load a song)."
+        )
+        score_help.setWordWrap(True)
+        score_help.setStyleSheet("color: #888; font-size: 11px;")
+        score_form.addRow(score_help)
+        layout.addWidget(score_group)
+
         # Processing group
         proc_group = QGroupBox("Processing")
         proc_group.setStyleSheet(audio_group.styleSheet())
@@ -233,3 +258,10 @@ class SettingsView(QWidget):
     @property
     def use_gpu(self) -> bool:
         return self._gpu_check.isChecked() and self._gpu_check.isEnabled()
+
+    @property
+    def scoring_difficulty_id(self) -> str:
+        data = self._difficulty_combo.currentData()
+        if isinstance(data, str) and data in ("strict", "normal", "casual"):
+            return data
+        return "strict"

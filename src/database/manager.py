@@ -130,6 +130,21 @@ class DatabaseManager:
         ).fetchone()
         return row is not None
 
+    def find_duplicate_song(self, title: str, artist: str) -> Optional[Song]:
+        """Same title + artist (case-insensitive, trimmed), ignoring empty vs missing artist."""
+        t = (title or "").strip()
+        a = (artist or "").strip()
+        row = self.conn.execute(
+            """
+            SELECT * FROM songs
+            WHERE lower(trim(title)) = lower(?)
+              AND lower(trim(COALESCE(artist, ''))) = lower(?)
+            LIMIT 1
+            """,
+            (t, a),
+        ).fetchone()
+        return self._row_to_song(row) if row else None
+
     # ── Performance CRUD ──
 
     def add_performance(self, perf: Performance) -> int:

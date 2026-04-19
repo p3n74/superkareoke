@@ -9,7 +9,7 @@ from PyQt6.QtGui import (
 )
 
 from src.database.models import PitchMap, PitchEvent
-from src.config import PITCH_FMIN, PITCH_FMAX
+from src.config import PITCH_FMIN, PITCH_FMAX, display_lane_half_semitones
 
 
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
@@ -86,10 +86,18 @@ class PitchWidget(QWidget):
         # Lyrics
         self._lyrics_line: str = ""
 
+        # Target lane vertical span: 0 = one row; casual widens to +/- N semitones
+        self._lane_half_semitones: float = 0.0
+
         # Render timer (60 fps)
         self._timer = QTimer()
         self._timer.setInterval(16)
         self._timer.timeout.connect(self.update)
+
+    def set_display_difficulty(self, difficulty_id: str) -> None:
+        """Widen target note bars on casual (±1 semitone) to match scoring tolerance."""
+        self._lane_half_semitones = display_lane_half_semitones(difficulty_id)
+        self.update()
 
     def set_pitch_map(self, pitch_map: PitchMap):
         self._pitch_map = pitch_map
@@ -260,7 +268,8 @@ class PitchWidget(QWidget):
         time_start = self._current_time - self._playhead_x_frac * self._visible_seconds
         time_end = self._current_time + (1 - self._playhead_x_frac) * self._visible_seconds
 
-        bar_height = max(6, area.height() / (self._semitone_max - self._semitone_min) * 0.8)
+        row_px = area.height() / max(1e-6, (self._semitone_max - self._semitone_min))
+        bar_height = max(6, row_px * 0.8)
 
         for i, seg in enumerate(self._note_segments):
             if seg["end_time"] < time_start or seg["start_time"] > time_end:
@@ -268,9 +277,17 @@ class PitchWidget(QWidget):
 
             x1 = self._time_to_x(seg["start_time"], area)
             x2 = self._time_to_x(seg["end_time"], area)
-            y = self._semitone_to_y(seg["semitone"], area)
-
-            rect = QRectF(x1, y - bar_height / 2, x2 - x1, bar_height)
+            center = float(seg["semitone"])
+            half = self._lane_half_semitones
+            if half > 0:
+                y_hi = self._semitone_to_y(center + half, area)
+                y_lo = self._semitone_to_y(center - half, area)
+                top_px = min(y_hi, y_lo)
+                h_px = max(abs(y_lo - y_hi), bar_height)
+                rect = QRectF(x1, top_px, x2 - x1, h_px)
+            else:
+                y = self._semitone_to_y(center, area)
+                rect = QRectF(x1, y - bar_height / 2, x2 - x1, bar_height)
 
             hit = self._segment_hits.get(i, "")
             if hit == "perfect":

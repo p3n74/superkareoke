@@ -1,6 +1,7 @@
 import math
 from typing import Optional
-from src.config import SCORE_PERFECT_CENTS, SCORE_GREAT_CENTS, SCORE_GOOD_CENTS, SCORE_OK_CENTS
+
+from src.config import scoring_thresholds_cents
 
 
 def cents_between(freq_a: float, freq_b: float) -> float:
@@ -10,14 +11,15 @@ def cents_between(freq_a: float, freq_b: float) -> float:
     return abs(1200 * math.log2(freq_a / freq_b))
 
 
-def classify_hit(cents_off: float) -> str:
-    if cents_off <= SCORE_PERFECT_CENTS:
+def classify_hit(cents_off: float, thresholds: tuple[int, int, int, int]) -> str:
+    perfect, great, good, ok = thresholds
+    if cents_off <= perfect:
         return "perfect"
-    if cents_off <= SCORE_GREAT_CENTS:
+    if cents_off <= great:
         return "great"
-    if cents_off <= SCORE_GOOD_CENTS:
+    if cents_off <= good:
         return "good"
-    if cents_off <= SCORE_OK_CENTS:
+    if cents_off <= ok:
         return "ok"
     return "miss"
 
@@ -38,8 +40,9 @@ class PitchComparator:
     Tracks which segments have been hit and accumulates scores.
     """
 
-    def __init__(self, note_segments: list[dict]):
+    def __init__(self, note_segments: list[dict], difficulty_id: str = "strict"):
         self._segments = note_segments
+        self._thresholds = scoring_thresholds_cents(difficulty_id)
         self._segment_samples: dict[int, list[float]] = {}
         self._segment_results: dict[int, str] = {}
         self._last_checked_idx = 0
@@ -111,7 +114,7 @@ class PitchComparator:
             hit_type = "miss"
         else:
             avg_cents = sum(samples) / len(samples)
-            hit_type = classify_hit(avg_cents)
+            hit_type = classify_hit(avg_cents, self._thresholds)
 
         self._segment_results[idx] = hit_type
         points = hit_points(hit_type)

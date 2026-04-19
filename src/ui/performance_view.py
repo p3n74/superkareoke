@@ -87,12 +87,14 @@ class PerformanceView(QWidget):
         db: DatabaseManager,
         mic_device_fn: Optional[Callable[[], Optional[int]]] = None,
         output_device_fn: Optional[Callable[[], Optional[int]]] = None,
+        scoring_difficulty_fn: Optional[Callable[[], str]] = None,
         parent=None,
     ):
         super().__init__(parent)
         self.db = db
         self._mic_device_fn = mic_device_fn or (lambda: None)
         self._output_device_fn = output_device_fn or (lambda: None)
+        self._scoring_difficulty_fn = scoring_difficulty_fn or (lambda: "strict")
         self._song: Song | None = None
         self._pitch_map: PitchMap | None = None
         self._comparator: PitchComparator | None = None
@@ -246,6 +248,7 @@ class PerformanceView(QWidget):
             data = Path(song.pitch_map_path).read_text(encoding="utf-8")
             self._pitch_map = PitchMap.from_json(data)
             self._pitch_widget.set_pitch_map(self._pitch_map)
+            self._pitch_widget.set_display_difficulty(self._scoring_difficulty_fn())
         else:
             self._pitch_map = None
 
@@ -275,7 +278,12 @@ class PerformanceView(QWidget):
             self._sync_guide_checkbox()
         else:
             if self._comparator is None and self._pitch_map:
-                self._comparator = PitchComparator(self._pitch_widget.note_segments)
+                diff = self._scoring_difficulty_fn()
+                self._pitch_widget.set_display_difficulty(diff)
+                self._comparator = PitchComparator(
+                    self._pitch_widget.note_segments,
+                    difficulty_id=diff,
+                )
             self.apply_audio_devices()
             self._playback.play()
             self._mic.start()
