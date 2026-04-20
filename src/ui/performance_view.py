@@ -2,9 +2,11 @@ import logging
 from pathlib import Path
 from typing import Callable, Optional
 
+from src.scoring.comparator import PitchComparator
+
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QDialog, QGridLayout, QCheckBox,
+    QDialog, QGridLayout, QCheckBox, QMessageBox,
 )
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont
@@ -19,8 +21,8 @@ from src.audio.playback import AudioPlayback
 from src.audio.pitch_detector import RealtimePitchDetector
 from src.audio.mic_processor import MicProcessor, MicProcessorSettings
 from src.audio.voice_fx import VoiceFx
+from src.audio.device_hints import preferred_blocksize_for_output
 from src.audio.vocal_monitor import VocalMonitor
-from src.scoring.comparator import PitchComparator
 from src.scoring.scorer import build_performance
 from src.ui.pitch_widget import PitchWidget
 from src.ui.lyrics_panel import LyricsPanel
@@ -95,6 +97,7 @@ class PerformanceView(QWidget):
         output_device_fn: Optional[Callable[[], Optional[int]]] = None,
         scoring_difficulty_fn: Optional[Callable[[], str]] = None,
         vocal_chain_settings_fn: Optional[Callable[[], dict]] = None,
+        use_gpu_fn: Optional[Callable[[], bool]] = None,
         parent=None,
     ):
         super().__init__(parent)
@@ -109,7 +112,10 @@ class PerformanceView(QWidget):
 
         self._mic = MicInput(chunk_size=512)
         self._playback = AudioPlayback(blocksize=512)
-        self._detector = RealtimePitchDetector()
+        self._detector = RealtimePitchDetector(
+            parent=self,
+            use_gpu_fn=use_gpu_fn,
+        )
         self._mic_proc = MicProcessor(self._mic.sample_rate)
         self._voice_fx = VoiceFx(self._mic.sample_rate)
         self._monitor = VocalMonitor(sample_rate=self._mic.sample_rate, blocksize=512)
@@ -143,6 +149,7 @@ class PerformanceView(QWidget):
         """)
         self._play_btn.clicked.connect(self._toggle_play)
         self._play_btn.setEnabled(False)
+        self._play_btn.setToolTip("")
         top_bar.addWidget(self._play_btn)
 
         self._stop_btn = QPushButton("■ Stop")
@@ -158,6 +165,14 @@ class PerformanceView(QWidget):
         top_bar.addWidget(self._stop_btn)
 
         layout.addLayout(top_bar)
+
+        self._sing_hint = QLabel(
+            "Use Sing! in the Catalog on a song with green (Ready) status, "
+            "or open Sing in the sidebar after a song is loaded."
+        )
+        self._sing_hint.setWordWrap(True)
+        self._sing_hint.setStyleSheet("color: #888; font-size: 11px; padding: 0 16px 4px 16px;")
+        layout.addWidget(self._sing_hint)
 
         backing_row = QHBoxLayout()
         backing_row.setContentsMargins(16, 0, 16, 8)
@@ -175,8 +190,9 @@ class PerformanceView(QWidget):
         self._lyrics = LyricsPanel()
         layout.addWidget(self._lyrics, stretch=0)
 
-        # Pitch visualizer
+        # Pitch visualizer (slightly lower repaint rate than default to keep UI responsive)
         self._pitch_widget = PitchWidget()
+        self._pitch_widget.set_render_interval_ms(33)
         layout.addWidget(self._pitch_widget, stretch=1)
 
         # Bottom info bar
@@ -333,18 +349,45 @@ class PerformanceView(QWidget):
                 log.info("Vocal monitor status: %s", status)
             self._last_monitor_status = status
 
-        # 512-sample blocks (~11.6 ms each) drive end-to-end monitor latency
-        # down. PortAudio in 'low' / WASAPI mode handles this comfortably.
-        self._mic.set_chunk_size(512)
-        self._playback.set_blocksize(512)
+        # Larger blocks on Bluetooth reduce underruns; WASAPI/low-latency paths
+        # still use the base size from preferred_blocksize_for_output.
+        bs_out = preferred_blocksize_for_output(backing_dev, 512)
+        bs_mon = preferred_blocksize_for_output(target_dev, 512)
+        bs = max(bs_out, bs_mon)
+        self._mic.set_chunk_size(bs)
+        self._playback.set_blocksize(bs)
+        self._monitor.set_blocksize(bs)
 
         self._monitor.set_gain_db(monitor_gain_db)
         self._monitor.set_device(target_dev)
         self._monitor.set_enabled(monitor_enabled and self._playback.is_playing)
 
+    def unload_song_if_removed(self, song_id: int) -> None:
+        """If the loaded song was deleted from the library, stop audio and reset the Sing UI."""
+        if self._song is None or self._song.id != song_id:
+            return
+        self._stop()
+        self._song = None
+        self._pitch_map = None
+        self._comparator = None
+        self._song_label.setText("No song loaded")
+        self._pitch_widget.set_pitch_map(PitchMap(song_id=0, events=[]))
+        self._lyrics.clear()
+        self._play_btn.setEnabled(False)
+        self._play_btn.setToolTip("")
+        self._sing_hint.setText(
+            "That song was removed from the catalog. Pick another song with Sing! "
+            "from the Catalog tab."
+        )
+        self._sing_hint.setStyleSheet("color: #f0ad4e; font-size: 11px; padding: 0 16px 4px 16px;")
+
     def load_song(self, song: Song):
         self._stop()
         self._lyrics.clear()
+        if song.id is not None:
+            fresh = self.db.get_song(song.id)
+            if fresh is not None:
+                song = fresh
         self._song = song
         self._song_label.setText(f"{song.title} — {song.artist}")
 
@@ -353,47 +396,109 @@ class PerformanceView(QWidget):
             data = Path(song.pitch_map_path).read_text(encoding="utf-8")
             self._pitch_map = PitchMap.from_json(data)
             self._pitch_widget.set_pitch_map(self._pitch_map)
-            self._pitch_widget.set_display_difficulty(self._scoring_difficulty_fn())
         else:
             self._pitch_map = None
+            self._pitch_widget.set_pitch_map(
+                PitchMap(song_id=int(song.id or 0), events=[]),
+            )
+
+        diff = self._scoring_difficulty_fn()
+        self._pitch_widget.set_display_difficulty(diff)
+        if self._pitch_map:
+            self._comparator = PitchComparator(
+                self._pitch_widget.note_segments,
+                difficulty_id=diff,
+            )
+        else:
+            self._comparator = None
 
         # Load backing track (instrumental or original mix per checkbox)
         self._sync_guide_checkbox()
         backing = self._backing_track_path()
         if backing is not None:
-            self._playback.load(backing)
-            self._play_btn.setEnabled(True)
-            self._update_time_label(0.0, self._playback.duration)
-            self.apply_audio_devices()
+            try:
+                self._playback.load(backing)
+            except Exception as e:
+                log.exception("Failed to load backing track %s", backing)
+                self._play_btn.setEnabled(False)
+                self._play_btn.setToolTip(f"Could not open backing file: {e}")
+                self._sing_hint.setText(
+                    f"Could not load backing audio ({backing.name}). "
+                    f"If the file was moved or deleted, re-process the song. ({e})"
+                )
+                self._sing_hint.setStyleSheet("color: #f0ad4e; font-size: 11px; padding: 0 16px 4px 16px;")
+            else:
+                self._play_btn.setEnabled(True)
+                self._play_btn.setToolTip("Start or resume: backing track + microphone + scoring.")
+                self._sing_hint.setText("")
+                self._sing_hint.setStyleSheet("color: #888; font-size: 11px; padding: 0 16px 4px 16px;")
+                self._update_time_label(0.0, self._playback.duration)
+                self.apply_audio_devices()
         else:
             self._play_btn.setEnabled(False)
+            inst = song.instrumental_path or "(not set)"
+            self._play_btn.setToolTip(
+                "No instrumental.wav to play. Finish Processing for this song, "
+                "or check that files still exist under your data/catalog folder."
+            )
+            self._sing_hint.setText(
+                f"No backing track on disk. Expected instrumental at:\n{inst}"
+            )
+            self._sing_hint.setStyleSheet("color: #f0ad4e; font-size: 11px; padding: 0 16px 4px 16px;")
 
-        lrc_path = CATALOG_DIR / str(song.id) / "lyrics.lrc"
-        if lrc_path.is_file():
-            self._lyrics.load_lrc_file(lrc_path)
+        if song.id is not None:
+            lrc_path = CATALOG_DIR / str(song.id) / "lyrics.lrc"
+            if lrc_path.is_file():
+                self._lyrics.load_lrc_file(lrc_path)
+            else:
+                self._lyrics.clear()
         else:
             self._lyrics.clear()
 
     def _toggle_play(self):
         if self._playback.is_playing:
-            self._playback.pause()
-            self._mic.stop()
+            try:
+                self._playback.pause()
+                self._mic.stop()
+            except Exception:
+                log.debug("pause/stop mic", exc_info=True)
             self._monitor.set_enabled(False)
             self._pitch_widget.stop_rendering()
             self._play_btn.setText("▶ Resume")
             self._sync_guide_checkbox()
         else:
-            if self._comparator is None and self._pitch_map:
-                diff = self._scoring_difficulty_fn()
-                self._pitch_widget.set_display_difficulty(diff)
-                self._comparator = PitchComparator(
-                    self._pitch_widget.note_segments,
-                    difficulty_id=diff,
+            try:
+                if self._comparator is None and self._pitch_map:
+                    diff = self._scoring_difficulty_fn()
+                    self._pitch_widget.set_display_difficulty(diff)
+                    self._comparator = PitchComparator(
+                        self._pitch_widget.note_segments,
+                        difficulty_id=diff,
+                    )
+                self.apply_audio_devices()
+                self._mic_proc.reset()
+                self._playback.play()
+                self._mic.start()
+            except Exception as e:
+                log.exception("Could not start performance audio")
+                try:
+                    self._playback.pause()
+                except Exception:
+                    pass
+                try:
+                    self._mic.stop()
+                except Exception:
+                    pass
+                self._monitor.set_enabled(False)
+                self._pitch_widget.stop_rendering()
+                QMessageBox.warning(
+                    self,
+                    "Could not start audio",
+                    f"The backing track or microphone could not be opened.\n\n{e}\n\n"
+                    "Check Settings → microphone and output device, "
+                    "then try again. On macOS, grant microphone access if prompted.",
                 )
-            self.apply_audio_devices()
-            self._mic_proc.reset()
-            self._playback.play()
-            self._mic.start()
+                return
             self._sync_guide_checkbox()
             self._pitch_widget.start_rendering()
             # apply_audio_devices() ran before play(); re-evaluate monitor now that
@@ -405,13 +510,22 @@ class PerformanceView(QWidget):
     def _stop(self):
         self._playback.stop()
         self._mic.stop()
+        self._detector.reset_buffer()
         self._monitor.set_enabled(False)
         self._mic_proc.reset()
         self._pitch_widget.stop_rendering()
         self._pitch_widget.reset()
         self._comparator = None
         self._play_btn.setText("▶ Start")
-        self._play_btn.setEnabled(self._song is not None and bool(self._song.instrumental_path))
+        inst_path = (
+            Path(self._song.instrumental_path)
+            if self._song and self._song.instrumental_path
+            else None
+        )
+        can_play = inst_path is not None and inst_path.is_file()
+        self._play_btn.setEnabled(bool(can_play))
+        if not can_play and self._song:
+            self._play_btn.setToolTip("Missing instrumental file for this song.")
         self._stop_btn.setEnabled(False)
         self._note_label.setText("")
         self._lyrics.set_time(0.0)
@@ -464,6 +578,7 @@ class PerformanceView(QWidget):
 
     def _on_song_end(self):
         self._mic.stop()
+        self._detector.reset_buffer()
         self._pitch_widget.stop_rendering()
         self._play_btn.setText("▶ Start")
         self._play_btn.setEnabled(True)

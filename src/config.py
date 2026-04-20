@@ -21,6 +21,46 @@ PITCH_HOP_MS = 10
 PITCH_FMIN = 65.0   # C2
 PITCH_FMAX = 1047.0  # C6
 
+# ── Offline processing (Demucs + torchcrepe) ─────────────────────────────
+# Presets trade separation / pitch quality for RAM, VRAM, and wall time.
+# UI: Settings → Processing quality. Optional env default for first launch:
+#   PROCESSING_QUALITY=fast|balanced|high
+PROCESSING_PRESETS: dict[str, dict[str, str | float | int]] = {
+    "fast": {
+        # Smaller Demucs chunks + lighter MUSDB bundle (no “plus” extra training).
+        "demucs_bundle": "HDEMUCS_HIGH_MUSDB",
+        "demucs_segment_s": 4.0,
+        "demucs_overlap": 0.05,
+        "crepe_model": "tiny",
+        "crepe_batch_size": 512,
+        "pitch_hop_ms": 20,
+    },
+    "balanced": {
+        "demucs_bundle": "HDEMUCS_HIGH_MUSDB",
+        "demucs_segment_s": 7.0,
+        "demucs_overlap": 0.08,
+        "crepe_model": "small",
+        "crepe_batch_size": 1024,
+        "pitch_hop_ms": 15,
+    },
+    "high": {
+        "demucs_bundle": "HDEMUCS_HIGH_MUSDB_PLUS",
+        "demucs_segment_s": 10.0,
+        "demucs_overlap": 0.1,
+        "crepe_model": "full",
+        "crepe_batch_size": 2048,
+        "pitch_hop_ms": PITCH_HOP_MS,
+    },
+}
+
+
+def get_processing_preset(preset_id: str) -> dict[str, str | float | int]:
+    """Return a mutable copy of the named preset (defaults to ``fast``)."""
+    key = (preset_id or "").strip().lower()
+    if key not in PROCESSING_PRESETS:
+        key = "fast"
+    return dict(PROCESSING_PRESETS[key])
+
 # Scoring thresholds (in cents; 100 cents = 1 semitone / one piano key)
 # Legacy names = "strict" preset (tightest).
 SCORE_PERFECT_CENTS = 25

@@ -119,3 +119,11 @@ class ProcessingView(QWidget):
         card = self._cards.get(song_id)
         if card:
             card.mark_finished(success, error)
+
+    def remove_song_card(self, song_id: int) -> None:
+        """Drop a queue card when the song was deleted from the catalog."""
+        card = self._cards.pop(song_id, None)
+        if card is None:
+            return
+        self._cards_layout.removeWidget(card)
+        card.deleteLater()

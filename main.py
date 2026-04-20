@@ -41,13 +41,20 @@ def main():
         output_device_fn=lambda: settings_view.selected_output_device,
         scoring_difficulty_fn=lambda: settings_view.scoring_difficulty_id,
         vocal_chain_settings_fn=lambda: settings_view.vocal_chain_settings,
+        use_gpu_fn=lambda: settings_view.use_gpu,
     )
     live_view = LiveView()
 
-    pipeline = ProcessingPipeline(db, use_gpu_fn=lambda: settings_view.use_gpu)
+    pipeline = ProcessingPipeline(
+        db,
+        use_gpu_fn=lambda: settings_view.use_gpu,
+        processing_preset_fn=lambda: settings_view.processing_preset_id,
+    )
     settings_view.gpu_preference_changed.connect(pipeline.reset_processors)
+    settings_view.processing_preset_changed.connect(pipeline.reset_processors)
     settings_view.audio_devices_changed.connect(performance_view.apply_audio_devices)
     settings_view.vocal_chain_changed.connect(performance_view.apply_audio_devices)
+    settings_view.load_settings_from_disk()
     performance_view.apply_audio_devices()
 
     window.set_page(0, catalog_view)
@@ -66,11 +73,23 @@ def main():
         window._switch_page(1)
 
     def on_sing_requested(song: Song):
-        performance_view.load_song(song)
+        if song.id is None:
+            return
+        song_from_db = db.get_song(song.id)
+        if song_from_db is None:
+            return
+        performance_view.load_song(song_from_db)
         window._switch_page(2)
 
     catalog_view.process_requested.connect(on_process_requested)
     catalog_view.sing_requested.connect(on_sing_requested)
+
+    def on_song_deleted(song_id: int):
+        processing_view.remove_song_card(song_id)
+        performance_view.unload_song_if_removed(song_id)
+
+    catalog_view.song_deleted.connect(on_song_deleted)
+    app.aboutToQuit.connect(settings_view.save_settings_to_disk)
 
     # ── Connect pipeline → views ──
     pipeline.song_progress.connect(processing_view.update_progress)

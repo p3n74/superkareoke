@@ -14,6 +14,11 @@ from typing import Optional
 import numpy as np
 import sounddevice as sd
 
+from src.audio.device_hints import (
+    is_bluetooth_output_device,
+    preferred_blocksize_for_output,
+    preferred_latency_for_output,
+)
 from src.audio.playback import _wasapi_extras_for
 
 log = logging.getLogger(__name__)
@@ -27,10 +32,6 @@ class VocalMonitor:
         self.enabled: bool = False
         self.gain_lin: float = 1.0
         self._lock = threading.Lock()
-        # Generous ring (~16 blocks ≈ 186 ms @ 512/44.1 k). With the writer
-        # now running on the PortAudio thread (no Qt-loop jitter) we don't
-        # need this much, but giving the buffer headroom kills the residual
-        # underruns that show up as "kztzt".
         self._cap = self._compute_capacity()
         self._buf = np.zeros(self._cap, dtype=np.float32)
         self._w = 0
@@ -44,9 +45,6 @@ class VocalMonitor:
         return max(8192, self.blocksize * 16)
 
     def _prime_silence(self) -> None:
-        # Pre-fill ~2 blocks of silence so the very first reader callbacks
-        # always find data. This also gives the writer a comfortable steady
-        # state of "~2 blocks ahead" rather than racing the reader.
         self._w = self.blocksize * 2
         self._r = 0
 
@@ -72,6 +70,19 @@ class VocalMonitor:
     def set_gain_db(self, db: float) -> None:
         self.gain_lin = float(10.0 ** (float(db) / 20.0))
 
+    def set_blocksize(self, blocksize: int) -> None:
+        blocksize = max(64, int(blocksize))
+        if blocksize == self.blocksize:
+            return
+        self.blocksize = blocksize
+        self._cap = self._compute_capacity()
+        with self._lock:
+            self._buf = np.zeros(self._cap, dtype=np.float32)
+            self._prime_silence()
+        if self.enabled and self._stream is not None:
+            self._close_stream()
+            self._open_stream()
+
     def set_sample_rate(self, sr: int) -> None:
         sr = int(sr)
         if sr == self.sample_rate:
@@ -86,13 +97,7 @@ class VocalMonitor:
             self._open_stream()
 
     def write(self, mono: np.ndarray, source_sr: Optional[int] = None) -> None:
-        """Push processed mic audio.
-
-        ``source_sr`` is the sample rate of ``mono``. When the monitor stream
-        is running at a different rate (e.g. WASAPI shared mode forced 48 kHz
-        for a 44.1 kHz mic) the input is resampled in-place to the monitor's
-        rate. This is what prevents the "kztztzt" buffer-rate mismatch.
-        """
+        """Push processed mic audio."""
         if not self.enabled or mono.size == 0:
             return
         if source_sr is not None and int(source_sr) != int(self.sample_rate):
@@ -112,9 +117,6 @@ class VocalMonitor:
                 return
         chunk = (mono.astype(np.float32, copy=False) * np.float32(self.gain_lin))
         n = chunk.shape[0]
-        # Cap queued audio at ~6 blocks (~70 ms @ 512/44.1 k). Above that,
-        # latency starts to feel sluggish — but below ~4 blocks we underrun
-        # on PortAudio's high-latency hosts (MME / DirectSound on Windows).
         target_max = self.blocksize * 6
         with self._lock:
             cap = self._cap
@@ -141,45 +143,84 @@ class VocalMonitor:
             with self._lock:
                 self._prime_silence()
             extras = _wasapi_extras_for(self.device)
+            base_bs = preferred_blocksize_for_output(self.device, self.blocksize)
+            lat_primary = preferred_latency_for_output(self.device)
+            attempts: list[tuple[str, int]] = [(lat_primary, base_bs)]
+            if not is_bluetooth_output_device(self.device):
+                attempts.append(("high", max(base_bs, 1024)))
+            attempts.append(("high", max(base_bs, 2048)))
+            seen: set[tuple[str, int]] = set()
+            deduped: list[tuple[str, int]] = []
+            for pair in attempts:
+                if pair not in seen:
+                    seen.add(pair)
+                    deduped.append(pair)
 
-            def _try_open(sr: int, use_extras: bool) -> sd.OutputStream:
+            def _try_open(sr: int, use_extras: bool, latency: str, bs: int) -> sd.OutputStream:
                 kwargs = dict(
                     samplerate=sr,
                     channels=1,
                     device=self.device,
                     dtype="float32",
                     callback=self._callback,
-                    blocksize=self.blocksize,
-                    latency="low",
+                    blocksize=max(64, int(bs)),
+                    latency=latency,
                 )
                 if use_extras and extras is not None:
                     kwargs["extra_settings"] = extras
                 return sd.OutputStream(**kwargs)
 
-            try:
-                self._stream = _try_open(self.sample_rate, use_extras=True)
-            except sd.PortAudioError:
-                try:
-                    self._stream = _try_open(self.sample_rate, use_extras=False)
-                except sd.PortAudioError:
-                    target_sr = self._device_default_samplerate()
-                    if target_sr and target_sr != self.sample_rate:
-                        log.info(
-                            "VocalMonitor device rejected %d Hz; switching to device default %d Hz",
-                            self.sample_rate, target_sr,
-                        )
-                        self.set_sample_rate(target_sr)
-                        self._stream = _try_open(self.sample_rate, use_extras=False)
-                    else:
-                        raise
+            last_err: Optional[Exception] = None
+            stream: Optional[sd.OutputStream] = None
+            for latency, bs in deduped:
+                for use_extras in (True, False):
+                    if use_extras and extras is None:
+                        continue
+                    try:
+                        stream = _try_open(self.sample_rate, use_extras, latency, bs)
+                        break
+                    except sd.PortAudioError as e:
+                        last_err = e
+                if stream is not None:
+                    break
+
+            if stream is None:
+                target_sr = self._device_default_samplerate()
+                if target_sr and target_sr != self.sample_rate:
+                    log.info(
+                        "VocalMonitor device rejected %d Hz; switching to device default %d Hz",
+                        self.sample_rate,
+                        target_sr,
+                    )
+                    self.set_sample_rate(target_sr)
+                    base_bs = preferred_blocksize_for_output(self.device, self.blocksize)
+                    for use_extras in (True, False):
+                        if use_extras and extras is None:
+                            continue
+                        try:
+                            stream = _try_open(
+                                self.sample_rate,
+                                use_extras,
+                                "high",
+                                max(base_bs, 1024),
+                            )
+                            break
+                        except sd.PortAudioError as e:
+                            last_err = e
+                elif last_err is not None:
+                    raise last_err
+
+            if stream is None:
+                raise RuntimeError("VocalMonitor: failed to open output stream")
+
+            self._stream = stream
             self._stream.start()
             log.info(
-                "VocalMonitor stream open (device=%s, sr=%d, blocksize=%d, latency=%s, wasapi=%s)",
+                "VocalMonitor stream open (device=%s, sr=%d, blocksize=%s, latency=%s)",
                 self.device,
                 self.sample_rate,
-                self.blocksize,
+                getattr(self._stream, "blocksize", None),
                 self._stream.latency,
-                extras is not None,
             )
         except Exception:
             log.warning("VocalMonitor failed to open output stream", exc_info=True)
@@ -229,7 +270,6 @@ class VocalMonitor:
                 out[n:] = 0.0
 
     def diagnostics(self) -> dict:
-        """Snapshot underrun / overflow counters (samples since stream open)."""
         with self._lock:
             return {
                 "queued_samples": self._w - self._r,

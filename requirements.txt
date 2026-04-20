@@ -19,7 +19,7 @@ torchaudio>=2.1.0
 
 # Audio I/O
 sounddevice>=0.4.6
-PyAudioWPatch>=0.2.12
+PyAudioWPatch>=0.2.12; sys_platform == "win32"
 
 # Audio processing
 numpy>=1.24.0

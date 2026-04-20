@@ -1,3 +1,5 @@
+import sys
+
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QPushButton, QStackedWidget, QLabel, QSizePolicy,
@@ -98,7 +100,12 @@ class MainWindow(QMainWindow):
 
     def _setup_shortcuts(self):
         for i in range(5):
-            shortcut = QShortcut(QKeySequence(f"Ctrl+{i + 1}"), self)
+            nav = i + 1
+            if sys.platform == "darwin":
+                seq = QKeySequence(f"Meta+{nav}")
+            else:
+                seq = QKeySequence(f"Ctrl+{nav}")
+            shortcut = QShortcut(seq, self)
             shortcut.activated.connect(lambda idx=i: self._switch_page(idx))
 
         QShortcut(QKeySequence("F11"), self).activated.connect(self._toggle_fullscreen)

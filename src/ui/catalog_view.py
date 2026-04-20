@@ -1,9 +1,15 @@
+import shutil
+
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QTableWidget, QTableWidgetItem, QHeaderView,
     QAbstractItemView, QDialog, QFormLayout, QMessageBox,
 )
+from pathlib import Path
+
 from PyQt6.QtCore import Qt, pyqtSignal
+
+from src.config import CATALOG_DIR
 from PyQt6.QtGui import QFont, QColor
 
 from src.database.manager import DatabaseManager
@@ -74,6 +80,7 @@ class CatalogView(QWidget):
     song_selected = pyqtSignal(Song)
     process_requested = pyqtSignal(Song)
     sing_requested = pyqtSignal(Song)
+    song_deleted = pyqtSignal(int)
 
     def __init__(self, db: DatabaseManager, parent=None):
         super().__init__(parent)
@@ -123,16 +130,18 @@ class CatalogView(QWidget):
 
         # Table
         self.table = QTableWidget()
-        self.table.setColumnCount(5)
-        self.table.setHorizontalHeaderLabels(["Title", "Artist", "Status", "", ""])
+        self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels(["Title", "Artist", "Status", "", "", ""])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
         self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
         self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
         self.table.setColumnWidth(2, 130)
         self.table.setColumnWidth(3, 100)
         self.table.setColumnWidth(4, 100)
+        self.table.setColumnWidth(5, 72)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
@@ -188,9 +197,23 @@ class CatalogView(QWidget):
             proc_btn.clicked.connect(lambda _, s=song: self._on_process_clicked(s))
             self.table.setCellWidget(row, 3, proc_btn)
 
-            # Sing button
+            # Sing button — READY plus an on-disk instrumental (paths can be stale)
+            inst_ok = (
+                bool(song.instrumental_path)
+                and Path(song.instrumental_path).is_file()
+            )
+            sing_ready = song.status == SongStatus.READY and inst_ok
             sing_btn = QPushButton("Sing!")
-            sing_btn.setEnabled(song.status == SongStatus.READY)
+            sing_btn.setEnabled(sing_ready)
+            if song.status == SongStatus.READY and not inst_ok:
+                sing_btn.setToolTip(
+                    "Marked ready but instrumental.wav is missing on disk. "
+                    "Re-process the song or restore the catalog data folder."
+                )
+            elif song.status != SongStatus.READY:
+                sing_btn.setToolTip("Finish processing (green status) before singing.")
+            else:
+                sing_btn.setToolTip("")
             sing_btn.setStyleSheet("""
                 QPushButton {
                     background: #e94560; color: white; border: none;
@@ -201,6 +224,24 @@ class CatalogView(QWidget):
             """)
             sing_btn.clicked.connect(lambda _, s=song: self.sing_requested.emit(s))
             self.table.setCellWidget(row, 4, sing_btn)
+
+            del_btn = QPushButton("Delete")
+            busy = song.status in _IN_PROGRESS
+            del_btn.setEnabled(not busy and song.id is not None)
+            if busy:
+                del_btn.setToolTip("Wait until processing finishes before deleting this song.")
+            else:
+                del_btn.setToolTip("Remove this song from the library and delete its catalog files.")
+            del_btn.setStyleSheet("""
+                QPushButton {
+                    background: #4a2c2c; color: #f0d0d0; border: none;
+                    border-radius: 4px; padding: 4px 8px;
+                }
+                QPushButton:hover { background: #6a3c3c; }
+                QPushButton:disabled { background: #333; color: #666; }
+            """)
+            del_btn.clicked.connect(lambda _, s=song: self._on_delete_clicked(s))
+            self.table.setCellWidget(row, 5, del_btn)
 
             self.table.setRowHeight(row, 44)
 
@@ -251,3 +292,40 @@ class CatalogView(QWidget):
             song = Song(title=title, artist=artist)
             self.db.add_song(song)
             self.refresh()
+
+    def _on_delete_clicked(self, song: Song):
+        if song.id is None:
+            return
+        if song.status in _IN_PROGRESS:
+            QMessageBox.information(
+                self,
+                "Still processing",
+                "This song is currently in the processing pipeline. Wait for it to finish, then delete.",
+            )
+            return
+        r = QMessageBox.question(
+            self,
+            "Delete song",
+            f'Delete "{song.title}" — {song.artist or "(no artist)"} from the library?\n\n'
+            "This removes the database entry and performance scores for this song, then deletes the "
+            f"folder data/catalog/{song.id}/ when possible (audio, stems, pitch map, lyrics).",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if r != QMessageBox.StandardButton.Yes:
+            return
+        sid = int(song.id)
+        song_dir = CATALOG_DIR / str(sid)
+        self.db.delete_song(sid)
+        self.song_deleted.emit(sid)
+        if song_dir.is_dir():
+            try:
+                shutil.rmtree(song_dir, ignore_errors=False)
+            except OSError as e:
+                QMessageBox.warning(
+                    self,
+                    "Could not delete all files",
+                    f"The song was removed from the library, but some files could not be deleted:\n{e}\n\n"
+                    f"You can manually remove the folder:\n{song_dir}",
+                )
+        self.refresh()

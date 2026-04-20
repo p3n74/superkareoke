@@ -1,4 +1,5 @@
 import logging
+import sys
 from math import gcd
 
 import numpy as np
@@ -7,6 +8,13 @@ import soundfile as sf
 from pathlib import Path
 from PyQt6.QtCore import QObject, pyqtSignal, QTimer
 from typing import Optional
+
+from src.audio.device_hints import (
+    is_bluetooth_output_device,
+    max_output_channels,
+    preferred_blocksize_for_output,
+    preferred_latency_for_output,
+)
 
 log = logging.getLogger(__name__)
 
@@ -18,6 +26,11 @@ def _wasapi_extras_for(device: Optional[int]):
     Returns ``None`` for non-WASAPI devices (or any error) so the caller can
     safely fall through to the host's default backend.
     """
+    if sys.platform != "win32":
+        return None
+    WasapiSettings = getattr(sd, "WasapiSettings", None)
+    if WasapiSettings is None:
+        return None
     if device is None:
         return None
     try:
@@ -25,7 +38,7 @@ def _wasapi_extras_for(device: Optional[int]):
         host = sd.query_hostapis(info["hostapi"])
         name = str(host.get("name", "")).lower()
         if "wasapi" in name:
-            return sd.WasapiSettings()
+            return WasapiSettings()
     except Exception:
         pass
     return None
@@ -44,11 +57,13 @@ class AudioPlayback(QObject):
         out: list[dict] = []
         for i, d in enumerate(devices):
             if d["max_output_channels"] > 0:
+                name = str(d["name"])
                 out.append({
                     "index": i,
-                    "name": d["name"],
+                    "name": name,
                     "channels": d["max_output_channels"],
                     "sample_rate": d["default_samplerate"],
+                    "bluetooth_hint": is_bluetooth_output_device(i),
                 })
         return out
 
@@ -63,6 +78,8 @@ class AudioPlayback(QObject):
         self._playing = False
         self._paused = False
         self._duration: float = 0.0
+        self._file_channels: int = 1
+        self._stream_out_channels: int = 1  # PortAudio stream channel count (may differ from file)
 
         self._timer = QTimer()
         self._timer.setInterval(50)
@@ -73,39 +90,76 @@ class AudioPlayback(QObject):
             raise RuntimeError("AudioPlayback: load a file before opening an output stream")
 
         extras = _wasapi_extras_for(self.device)
+        dev_max = max_output_channels(self.device)
+        self._stream_out_channels = max(1, min(self._file_channels, dev_max))
+        if self._stream_out_channels < self._file_channels:
+            log.info(
+                "Output device allows %d ch; backing track has %d — mixing/downmixing for playback.",
+                dev_max,
+                self._file_channels,
+            )
 
-        def _try_open(use_extras: bool) -> sd.OutputStream:
+        base_bs = preferred_blocksize_for_output(self.device, self.blocksize)
+        lat_primary = preferred_latency_for_output(self.device)
+        attempts: list[tuple[str, int]] = [(lat_primary, base_bs)]
+        if not is_bluetooth_output_device(self.device):
+            attempts.append(("high", max(base_bs, 1024)))
+        attempts.append(("high", max(base_bs, 2048)))
+
+        seen: set[tuple[str, int]] = set()
+        deduped: list[tuple[str, int]] = []
+        for pair in attempts:
+            if pair not in seen:
+                seen.add(pair)
+                deduped.append(pair)
+
+        def _try_open(use_extras: bool, latency: str, bs: int) -> sd.OutputStream:
             kwargs = dict(
                 samplerate=self._sample_rate,
-                channels=self._audio_data.shape[1],
+                channels=self._stream_out_channels,
                 device=self.device,
                 dtype="float32",
                 callback=self._playback_callback,
-                blocksize=self.blocksize,
-                latency="low",
+                blocksize=max(64, int(bs)),
+                latency=latency,
             )
             if use_extras and extras is not None:
                 kwargs["extra_settings"] = extras
             return sd.OutputStream(**kwargs)
 
-        try:
-            return _try_open(use_extras=True)
-        except sd.PortAudioError as first_err:
-            try:
-                return _try_open(use_extras=False)
-            except sd.PortAudioError as second_err:
-                # Invalid sample rate is the typical case (WASAPI shared mode
-                # locks to the Windows mixer rate). Resample the buffer to the
-                # device's preferred rate and retry.
-                target_sr = self._device_default_samplerate()
-                if target_sr is not None and target_sr != self._sample_rate:
-                    log.info(
-                        "Output device rejected %d Hz; resampling backing track to %d Hz",
-                        self._sample_rate, target_sr,
+        last_err: Optional[Exception] = None
+        for latency, bs in deduped:
+            for use_extras in (True, False):
+                if use_extras and extras is None:
+                    continue
+                try:
+                    return _try_open(use_extras, latency, bs)
+                except sd.PortAudioError as e:
+                    last_err = e
+                    log.debug(
+                        "OutputStream open failed latency=%s blocksize=%d wasapi=%s: %s",
+                        latency,
+                        bs,
+                        use_extras,
+                        e,
                     )
-                    self._resample_to(target_sr)
-                    return _try_open(use_extras=False)
-                raise second_err from first_err
+
+        target_sr = self._device_default_samplerate()
+        if target_sr is not None and target_sr != self._sample_rate:
+            log.info(
+                "Output device rejected %d Hz; resampling backing track to %d Hz",
+                self._sample_rate,
+                target_sr,
+            )
+            self._resample_to(target_sr)
+            try:
+                return _try_open(False, "high", max(base_bs, 1024))
+            except sd.PortAudioError as e:
+                last_err = e
+
+        if last_err is not None:
+            raise last_err
+        raise RuntimeError("AudioPlayback: failed to open output stream")
 
     def _device_default_samplerate(self) -> Optional[int]:
         try:
@@ -178,6 +232,7 @@ class AudioPlayback(QObject):
         if data.ndim == 1:
             data = data.reshape(-1, 1)
         self._audio_data = data
+        self._file_channels = int(data.shape[1])
         self._sample_rate = sr
         self._duration = len(data) / sr
         self._position = 0
@@ -271,13 +326,37 @@ class AudioPlayback(QObject):
         end = self._position + frames
         if end > len(self._audio_data):
             remaining = len(self._audio_data) - self._position
-            outdata[:remaining] = self._audio_data[self._position:len(self._audio_data)]
+            sl = self._audio_data[self._position : len(self._audio_data)]
+            fc = self._file_channels
+            oc = self._stream_out_channels
+            if fc == oc:
+                outdata[:remaining] = sl
+            elif fc == 2 and oc == 1:
+                outdata[:remaining, 0] = 0.5 * (sl[:, 0] + sl[:, 1])
+            elif fc == 1 and oc >= 2:
+                outdata[:remaining, 0] = sl[:, 0]
+                for c in range(1, oc):
+                    outdata[:remaining, c] = sl[:, 0]
+            else:
+                outdata[:remaining] = sl[:, :oc]
             outdata[remaining:] = 0
             self._position = len(self._audio_data)
             self._playing = False
             self.playback_finished.emit()
         else:
-            outdata[:] = self._audio_data[self._position:end]
+            sl = self._audio_data[self._position:end]
+            fc = self._file_channels
+            oc = self._stream_out_channels
+            if fc == oc:
+                outdata[:] = sl
+            elif fc == 2 and oc == 1:
+                outdata[:, 0] = 0.5 * (sl[:, 0] + sl[:, 1])
+            elif fc == 1 and oc >= 2:
+                outdata[:, 0] = sl[:, 0]
+                for c in range(1, oc):
+                    outdata[:, c] = sl[:, 0]
+            else:
+                outdata[:] = sl[:, :oc]
             self._position = end
 
     def _emit_position(self):

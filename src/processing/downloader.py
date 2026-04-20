@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import logging
+import os
 import shutil
 import subprocess
 import sys
@@ -9,6 +10,58 @@ from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _ffmpeg_bin_dir() -> Optional[Path]:
+    """Return a directory that contains both ``ffmpeg`` and ``ffprobe`` executables.
+
+    GUI-launched apps on macOS often lack Homebrew's ``/opt/homebrew/bin`` on
+    ``PATH``, so we probe common locations in addition to ``shutil.which``.
+    """
+    candidates: list[Path] = []
+    seen: set[str] = set()
+
+    def _add(p: Optional[str]) -> None:
+        if not p:
+            return
+        d = Path(p).resolve().parent
+        key = str(d)
+        if key not in seen:
+            seen.add(key)
+            candidates.append(d)
+
+    _add(shutil.which("ffmpeg"))
+    _add(shutil.which("ffprobe"))
+
+    for raw in (
+        "/opt/homebrew/bin",  # Apple Silicon Homebrew
+        "/usr/local/bin",  # Intel Mac Homebrew / many Linux installs
+    ):
+        d = Path(raw)
+        key = str(d.resolve())
+        if key not in seen:
+            seen.add(key)
+            candidates.append(d)
+
+    if sys.platform == "win32":
+        for raw in (
+            r"C:\ffmpeg\bin",
+            os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WinGet\Links"),
+            r"C:\Program Files\ffmpeg\bin",
+        ):
+            d = Path(raw)
+            if not d.exists():
+                continue
+            key = str(d.resolve())
+            if key not in seen:
+                seen.add(key)
+                candidates.append(d)
+
+    ext = ".exe" if sys.platform == "win32" else ""
+    for d in candidates:
+        if (d / f"ffmpeg{ext}").is_file() and (d / f"ffprobe{ext}").is_file():
+            return d
+    return None
 
 
 def _yt_dlp_command_prefix() -> list[str]:
@@ -22,6 +75,29 @@ def _yt_dlp_command_prefix() -> list[str]:
     raise RuntimeError(
         "yt-dlp is not available. Install it in this Python environment: pip install yt-dlp"
     )
+
+
+def _yt_dlp_ffmpeg_args() -> list[str]:
+    """Extra yt-dlp arguments so postprocessing can find ffmpeg/ffprobe."""
+    d = _ffmpeg_bin_dir()
+    if d is None:
+        return []
+    loc = str(d)
+    logger.info("yt-dlp: using --ffmpeg-location %s", loc)
+    return ["--ffmpeg-location", loc]
+
+
+def _subprocess_env_with_ffmpeg() -> dict[str, str]:
+    """Prepend the ffmpeg directory to PATH for subprocesses."""
+    env = os.environ.copy()
+    d = _ffmpeg_bin_dir()
+    if d is None:
+        return env
+    prefix = str(d)
+    path = env.get("PATH", "")
+    if prefix not in path.split(os.pathsep):
+        env["PATH"] = prefix + os.pathsep + path
+    return env
 
 
 class YouTubeDownloader:
@@ -39,6 +115,7 @@ class YouTubeDownloader:
 
         cmd = [
             *_yt_dlp_command_prefix(),
+            *_yt_dlp_ffmpeg_args(),
             f"ytsearch1:{query}",
             "--extract-audio",
             "--audio-format", "wav",
@@ -53,7 +130,11 @@ class YouTubeDownloader:
         t0 = time.perf_counter()
         try:
             result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=300,
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=300,
+                env=_subprocess_env_with_ffmpeg(),
             )
         except FileNotFoundError as e:
             raise RuntimeError(
@@ -64,8 +145,15 @@ class YouTubeDownloader:
             raise RuntimeError("yt-dlp download timed out after 5 minutes")
 
         if result.returncode != 0:
-            logger.error("yt-dlp stderr: %s", result.stderr.strip()[:2000])
-            raise RuntimeError(f"yt-dlp failed: {result.stderr.strip()}")
+            err = result.stderr.strip()
+            logger.error("yt-dlp stderr: %s", err[:2000])
+            if "ffmpeg" in err.lower() or "ffprobe" in err.lower():
+                raise RuntimeError(
+                    "yt-dlp needs FFmpeg (ffmpeg and ffprobe). Install it — on macOS "
+                    "with Homebrew: `brew install ffmpeg` — then restart the app so "
+                    f"PATH is picked up, or ensure both binaries are on PATH.\n{err}"
+                )
+            raise RuntimeError(f"yt-dlp failed: {err}")
 
         logger.info("yt-dlp finished in %.1fs", time.perf_counter() - t0)
         downloaded_path = result.stdout.strip().split("\n")[-1]

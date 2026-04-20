@@ -89,10 +89,14 @@ class PitchWidget(QWidget):
         # Target lane vertical span: 0 = one row; casual widens to +/- N semitones
         self._lane_half_semitones: float = 0.0
 
-        # Render timer (60 fps)
+        # Render timer (default ~30 fps; Sing mode lowers UI load vs 60 fps)
         self._timer = QTimer()
-        self._timer.setInterval(16)
+        self._timer.setInterval(33)
         self._timer.timeout.connect(self.update)
+
+    def set_render_interval_ms(self, ms: int) -> None:
+        """Chart repaint rate while animating (16–50 ms typical)."""
+        self._timer.setInterval(max(16, min(80, int(ms))))
 
     def set_display_difficulty(self, difficulty_id: str) -> None:
         """Widen target note bars on casual (±1 semitone) to match scoring tolerance."""

@@ -2,13 +2,14 @@ import logging
 import math
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import torch
 import torchaudio
 
-from src.config import PITCH_FMIN, PITCH_FMAX, PITCH_HOP_MS, SAMPLE_RATE
+from src.config import PITCH_FMIN, PITCH_FMAX, SAMPLE_RATE, get_processing_preset
+from src.processing.memory import release_torch_memory
 from src.processing.wav_io import load_wave
 from src.database.models import PitchEvent, PitchMap
 
@@ -37,11 +38,21 @@ def freq_to_cents(freq: float, ref_freq: float) -> float:
 class PitchExtractor:
     """Extracts pitch from audio using torchcrepe."""
 
-    def __init__(self, model_size: str = "full", device: Optional[str] = None):
-        self.model_size = model_size
+    def __init__(
+        self,
+        model_size: Optional[str] = None,
+        device: Optional[str] = None,
+        preset: Optional[dict[str, Any]] = None,
+    ):
+        self._preset = dict(preset) if preset else get_processing_preset("fast")
+        self.model_size = str(model_size or self._preset.get("crepe_model", "tiny"))
         if device is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            from src.processing.torch_device import resolve_processing_device_string
+
+            device = resolve_processing_device_string(True)
         self.device = torch.device(device)
+        self._hop_ms = int(self._preset.get("pitch_hop_ms", 10))
+        self._batch_size = int(self._preset.get("crepe_batch_size", 512))
 
     def extract(
         self, audio_path: Path, song_id: int,
@@ -54,11 +65,11 @@ class PitchExtractor:
         audio, sr = load_wave(audio_path)
         n_sec = audio.shape[-1] / float(sr)
         logger.info(
-            "Pitch: loaded %s (%.2fs audio, %d ch @ %d Hz) device=%s model=%s",
+            "Pitch: loaded %s (%.2fs @ %d ch @ %d Hz) device=%s model=%s hop=%dms batch=%d",
             audio_path, n_sec, audio.shape[0], sr, self.device, self.model_size,
+            self._hop_ms, self._batch_size,
         )
 
-        # Convert to mono
         if audio.shape[0] > 1:
             audio = audio.mean(dim=0, keepdim=True)
 
@@ -68,7 +79,7 @@ class PitchExtractor:
             logger.debug("Pitch: resampled %d Hz -> %d in %.2fs", sr, SAMPLE_RATE, time.perf_counter() - t_rs)
 
         audio = audio.to(self.device)
-        hop_length = int(SAMPLE_RATE * PITCH_HOP_MS / 1000)
+        hop_length = int(SAMPLE_RATE * self._hop_ms / 1000)
         n_frames = 1 + (audio.shape[-1] - 1) // hop_length
         if self.device.type == "cuda":
             backend = f"GPU (CUDA, {self.device})"
@@ -77,12 +88,8 @@ class PitchExtractor:
         else:
             backend = "CPU"
         logger.info(
-            "Pitch: running torchcrepe.predict on %s (~%d frames, hop=%d ms). "
-            "Expect this step to be slow on CPU (often many minutes per song); "
-            "on CUDA it is usually much faster (roughly ~0.5-3x realtime is typical).",
-            backend,
-            n_frames,
-            PITCH_HOP_MS,
+            "Pitch: torchcrepe.predict on %s (~%d frames, hop=%d ms, batch=%d).",
+            backend, n_frames, self._hop_ms, self._batch_size,
         )
 
         t_pred = time.perf_counter()
@@ -91,22 +98,25 @@ class PitchExtractor:
             fmin=PITCH_FMIN, fmax=PITCH_FMAX,
             model=self.model_size, device=self.device,
             return_periodicity=True,
-            batch_size=2048,
+            batch_size=self._batch_size,
         )
         logger.info("Pitch: torchcrepe.predict finished in %.1fs", time.perf_counter() - t_pred)
+
+        del audio
+        release_torch_memory()
 
         pitch = pitch.squeeze().cpu().numpy()
         periodicity = periodicity.squeeze().cpu().numpy()
 
-        # Apply Viterbi smoothing
         pitch = np.where(periodicity > confidence_threshold, pitch, 0.0)
 
         events: list[PitchEvent] = []
         n_pitch = len(pitch)
         last_emit = -1
+        hop_s = self._hop_ms / 1000.0
 
         for i, (f, c) in enumerate(zip(pitch, periodicity)):
-            t = i * PITCH_HOP_MS / 1000.0
+            t = i * hop_s
             freq = float(f) if c > confidence_threshold else 0.0
             note = freq_to_note(freq) if freq > 0 else ""
             events.append(PitchEvent(
@@ -124,6 +134,8 @@ class PitchExtractor:
                 if progress_callback:
                     progress_callback(frac)
 
+        del pitch, periodicity
+
         if progress_callback:
             progress_callback(1.0)
         logger.info("Pitch: total extract time %.1fs (events=%d)", time.perf_counter() - t0, len(events))
@@ -132,5 +144,5 @@ class PitchExtractor:
             song_id=song_id,
             events=events,
             sample_rate=SAMPLE_RATE,
-            hop_ms=PITCH_HOP_MS,
+            hop_ms=self._hop_ms,
         )

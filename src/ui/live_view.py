@@ -5,7 +5,11 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont
 
 from src.audio.mic_input import MicInput
-from src.audio.system_capture import SystemAudioCapture
+from src.audio.system_capture import (
+    SystemAudioCapture,
+    list_system_audio_input_devices,
+    system_audio_uses_wasapi_loopback,
+)
 from src.audio.pitch_detector import RealtimePitchDetector
 from src.ui.pitch_widget import PitchWidget
 
@@ -18,8 +22,12 @@ class LiveView(QWidget):
         super().__init__(parent)
         self._mic = MicInput()
         self._system_capture = SystemAudioCapture()
-        self._user_detector = RealtimePitchDetector(buffer_duration_ms=80)
-        self._system_detector = RealtimePitchDetector(buffer_duration_ms=80)
+        self._user_detector = RealtimePitchDetector(
+            parent=self, buffer_duration_ms=80,
+        )
+        self._system_detector = RealtimePitchDetector(
+            parent=self, buffer_duration_ms=80,
+        )
         self._running = False
 
         self._setup_ui()
@@ -38,13 +46,32 @@ class LiveView(QWidget):
         title.setStyleSheet("color: #e94560;")
         layout.addWidget(title)
 
-        desc = QLabel(
-            "Play any song on your computer (Spotify, YouTube, etc.) and sing along.\n"
-            "The app captures system audio and your microphone to compare pitch in real-time."
-        )
+        if system_audio_uses_wasapi_loopback():
+            desc_text = (
+                "Play any song on your computer (Spotify, YouTube, etc.) and sing along.\n"
+                "The app captures system audio (WASAPI loopback) and your microphone "
+                "to compare pitch in real-time."
+            )
+        else:
+            desc_text = (
+                "Play any song on your computer (Spotify, YouTube, etc.) and sing along.\n"
+                "Route playback through a virtual loopback device (e.g. BlackHole on macOS) "
+                "so the «System audio input» below receives the mix, while the app still "
+                "captures your microphone separately."
+            )
+        desc = QLabel(desc_text)
         desc.setStyleSheet("color: #888; font-size: 12px;")
         desc.setWordWrap(True)
         layout.addWidget(desc)
+
+        if not system_audio_uses_wasapi_loopback():
+            dev_row = QHBoxLayout()
+            dev_row.addWidget(QLabel("System audio input:"))
+            self._system_input_combo = QComboBox()
+            self._system_input_combo.setMinimumWidth(320)
+            self._refresh_system_input_devices()
+            dev_row.addWidget(self._system_input_combo, 1)
+            layout.addLayout(dev_row)
 
         # Controls
         controls = QHBoxLayout()
@@ -75,6 +102,7 @@ class LiveView(QWidget):
 
         # Pitch visualization
         self._pitch_widget = PitchWidget()
+        self._pitch_widget.set_render_interval_ms(33)
         layout.addWidget(self._pitch_widget, stretch=1)
 
         # Info
@@ -87,6 +115,20 @@ class LiveView(QWidget):
         self._song_pitch_label.setStyleSheet("color: #f0ad4e; font-size: 12px;")
         info_layout.addWidget(self._song_pitch_label)
         layout.addLayout(info_layout)
+
+    def _refresh_system_input_devices(self) -> None:
+        if system_audio_uses_wasapi_loopback():
+            return
+        self._system_input_combo.blockSignals(True)
+        self._system_input_combo.clear()
+        for d in list_system_audio_input_devices():
+            label = d["name"]
+            if d.get("priority"):
+                label = f"★ {label}"
+            self._system_input_combo.addItem(label, userData=d["index"])
+        if self._system_input_combo.count() == 0:
+            self._system_input_combo.addItem("(no input devices found)", userData=None)
+        self._system_input_combo.blockSignals(False)
 
     def _connect_signals(self):
         self._mic.audio_chunk.connect(self._on_mic_chunk)
@@ -101,8 +143,14 @@ class LiveView(QWidget):
             self._start()
 
     def _start(self):
+        input_dev = None
+        if not system_audio_uses_wasapi_loopback():
+            input_dev = self._system_input_combo.currentData()
+            if input_dev is None:
+                self._note_label.setText("Error: choose a system audio input device.")
+                return
         try:
-            self._system_capture.start()
+            self._system_capture.start(input_device=input_dev)
         except RuntimeError as e:
             self._note_label.setText(f"Error: {e}")
             return
@@ -130,6 +178,8 @@ class LiveView(QWidget):
     def _stop(self):
         self._mic.stop()
         self._system_capture.stop()
+        self._user_detector.reset_buffer()
+        self._system_detector.reset_buffer()
         self._pitch_widget.stop_rendering()
         self._pitch_widget.reset()
         self._running = False

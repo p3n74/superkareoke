@@ -7,7 +7,9 @@ from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
 import soundfile as sf
 
-from src.config import CATALOG_DIR
+from src.config import CATALOG_DIR, get_processing_preset
+from src.processing.memory import release_torch_memory
+from src.processing.torch_device import resolve_processing_device_string
 from src.database.manager import DatabaseManager
 from src.database.models import Song, SongStatus
 from src.processing.downloader import YouTubeDownloader
@@ -79,6 +81,7 @@ class PipelineWorker(QObject):
                 ),
             )
             logger.info("Separation done in %.1fs", time.perf_counter() - t_sep)
+            release_torch_memory()
 
             self.db.update_song_paths(
                 song.id,
@@ -122,6 +125,9 @@ class PipelineWorker(QObject):
             except Exception as lyrics_err:
                 logger.warning("Lyrics fetch skipped: %s", lyrics_err)
 
+            del stems
+            release_torch_memory()
+
             # Done
             self.db.update_song_status(song.id, SongStatus.READY)
             self.progress.emit(song.id, "Ready", 1.0)
@@ -151,33 +157,38 @@ class ProcessingPipeline(QObject):
         self,
         db: DatabaseManager,
         use_gpu_fn: Optional[Callable[[], bool]] = None,
+        processing_preset_fn: Optional[Callable[[], str]] = None,
     ):
         super().__init__()
         self.db = db
         self.downloader = YouTubeDownloader()
         self._use_gpu_fn = use_gpu_fn
+        self._processing_preset_fn = processing_preset_fn
         self._separator = None
         self._extractor = None
         self._active_workers: dict[int, tuple[QThread, PipelineWorker]] = {}
 
-    def _resolve_processing_device(self) -> Optional[str]:
-        """Return ``\"cpu\"`` to force CPU, or ``None`` for CUDA when allowed and available."""
+    def _resolve_processing_device(self) -> str:
+        """Return a ``torch.device`` string (``cpu``, ``cuda``, ``cuda:N``, ``mps``, …)."""
         try:
             want_gpu = self._use_gpu_fn() if self._use_gpu_fn else True
         except Exception:
             want_gpu = True
-        if not want_gpu:
-            return "cpu"
-        import torch
-        if torch.cuda.is_available():
-            return None
-        return "cpu"
+        return resolve_processing_device_string(want_gpu)
 
     def reset_processors(self) -> None:
-        """Drop cached Demucs / CREPE models (e.g. after GPU preference changes)."""
+        """Drop cached Demucs / CREPE models (e.g. after GPU or quality preset changes)."""
         self._separator = None
         self._extractor = None
+        release_torch_memory()
         logger.info("Processing models reset for next job.")
+
+    def _current_processing_preset(self) -> dict:
+        try:
+            pid = self._processing_preset_fn() if self._processing_preset_fn else "fast"
+        except Exception:
+            pid = "fast"
+        return get_processing_preset(str(pid))
 
     @property
     def separator(self):
@@ -185,10 +196,14 @@ class ProcessingPipeline(QObject):
             from src.processing.separator import VocalSeparator
             import torch
             dev = self._resolve_processing_device()
-            self._separator = VocalSeparator(device=dev)
+            preset = self._current_processing_preset()
+            self._separator = VocalSeparator(device=dev, preset=preset)
             logger.info(
-                "VocalSeparator using device=%s torch.cuda.is_available()=%s",
+                "VocalSeparator device=%s preset=%s bundle=%s seg=%s torch.cuda=%s",
                 self._separator.device,
+                self._processing_preset_fn() if self._processing_preset_fn else "fast",
+                preset.get("demucs_bundle"),
+                preset.get("demucs_segment_s"),
                 torch.cuda.is_available(),
             )
         return self._separator
@@ -199,10 +214,15 @@ class ProcessingPipeline(QObject):
             from src.processing.pitch_extractor import PitchExtractor
             import torch
             dev = self._resolve_processing_device()
-            self._extractor = PitchExtractor(device=dev)
+            preset = self._current_processing_preset()
+            self._extractor = PitchExtractor(device=dev, preset=preset)
             logger.info(
-                "PitchExtractor using device=%s torch.cuda.is_available()=%s",
+                "PitchExtractor device=%s preset=%s crepe=%s hop=%sms batch=%s torch.cuda=%s",
                 self._extractor.device,
+                self._processing_preset_fn() if self._processing_preset_fn else "fast",
+                preset.get("crepe_model"),
+                preset.get("pitch_hop_ms"),
+                preset.get("crepe_batch_size"),
                 torch.cuda.is_available(),
             )
         return self._extractor
